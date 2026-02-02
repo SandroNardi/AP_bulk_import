@@ -61,7 +61,7 @@ def get_dashboard_data():
                         if t.lower() == "connectivity":
                             network_connectivity_map[net_id] = t
             
-            networks = dashboard.organizations.getOrganizationNetworks(o_id)
+            networks = dashboard.organizations.getOrganizationNetworks(o_id, total_pages='all')
             for net in networks:
                 network_list.append({
                     'orgId': o_id,
