@@ -1,4 +1,4 @@
-## AP Claim Automation for Meraki (Volvo)
+## AP Claim Automation for Meraki
 
 This repository contains two Python scripts that help validate a supplier-provided list of access points (APs) and then automatically claim and configure those APs in the Cisco Meraki Dashboard.
 
