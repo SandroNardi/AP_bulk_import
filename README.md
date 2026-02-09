@@ -8,9 +8,9 @@ This repository contains two Python scripts that help validate a supplier-provid
   Reads the supplier CSV report, cross-checks each AP serial against the Meraki Dashboard inventory, resolves network names, and prepares validated output files that are safe to claim.
 
 - **`2_claim_devices.py`**  
-  Takes the validated CSV produced in the previous step, bulk-claims devices into their target networks, and updates AP names and tags in the Meraki Dashboard.
+  Takes the validated CSV produced in the previous step, bulk-claims devices into their target networks, and updates AP names, tags, and addresses in the Meraki Dashboard.
 
-Both scripts use the Meraki Dashboard API and rely on an environment variable `MK_CSM_KEY` that must contain a valid API key with sufficient permissions.
+Both scripts use the Meraki Dashboard API and rely on an environment variable `MK_CSM_KEY` that must contain a valid API key with sufficient permissions. The API client is configured with rate-limit handling, automatic retries on 429 responses, and extended timeouts for large organizations.
 
 ### Prerequisites
 
@@ -53,9 +53,10 @@ Validate the supplier list against the Meraki inventory and networks, detect iss
      - Retrieves all inventory devices and builds an `inventory_map` keyed by serial:
        - `orgId`, `orgName`, `networkId`.
        - Tracks networks whose devices carry a `connectivity` tag in `network_connectivity_map`.
+       - Tracks networks whose devices carry a `diagnostic` tag in `network_diagnostic_map`.
      - Retrieves all networks and builds a `network_list` of `{orgId, orgName, netId, netName}`.
 
-3. **Flexible network name matching**
+3. **Flexible network name matching & validation**
    - For each input row (shipment date, network name, serial number):
      - If the serial already exists in `inventory_map`:
        - Marks the row as **already added**.
@@ -66,17 +67,20 @@ Validate the supplier list against the Meraki inventory and networks, detect iss
          - First tries a **case-insensitive exact match** on `netName`.
          - If none, tries a **prefix match** (`netName` starts with the CSV network name).
        - If exactly one match is found:
+         - **Validates network name format** (`validate_and_extract_prefix`): expects `CC-REG-PID-Company Name` (e.g. 2-letter country code, 3-char region, partner ID). Invalid format → error output.
+         - **Checks for mandatory `diagnostic` tag**: the network must have a device with the `diagnostic` tag. Missing → error output.
          - Uses `get_next_ap_number` to:
            - Inspect existing devices in that network.
-           - Find the highest AP number in names like `FullNetworkName-APXX-N`.
+           - Find the highest AP number in names like `CC-REG-PID-APXX-N`.
+           - **Extract address** from any existing device in the network (cached per network) for later use.
            - Compute the next progressive AP number (`01`–`99`), cached per network.
-         - Constructs the AP name: `FullNetworkName-APXX-N`.
+         - Constructs the AP name: `CC-REG-PID-APXX-N` (using the validated prefix, not the full network name).
          - Validates:
            - AP name length must be `< 50` characters.
            - Progressive number must be `<= 99`.
          - If valid:
            - Marks status as `good`.
-           - Adds organization, network, and generated AP name to the **validated** output.
+           - Adds organization, network, generated AP name, **Diagnostic Tag**, and **Address** to the **validated** output.
            - Marks `Connectivity` as `yes` and stores the connectivity tag if the network has a `connectivity` tag in `network_connectivity_map`.
        - If zero or multiple network matches are found:
          - Adds the row to the **error** output with an appropriate message:
@@ -91,7 +95,7 @@ Validate the supplier list against the Meraki inventory and networks, detect iss
    - Each output uses a consistent set of columns, including:
      - `Status`, `Already Added`, `Shipment Date`, `Input Network Name`, `Serial Number`,
        `Org ID`, `Org Name`, `Network ID`, `Full Network Name`,
-       `Connectivity`, `Connectivity Tag`, `AP Name`, `Messages`.
+       `Connectivity`, `Connectivity Tag`, `Diagnostic Tag`, `Address`, `AP Name`, `Messages`.
 
 **How to run:**
 
@@ -104,7 +108,7 @@ After successful execution, use the generated `*_validated_upload.csv` as input 
 ### Script 2: Claim Devices (`2_claim_devices.py`)
 
 **Purpose:**  
-Take a validated list of APs and automate bulk claiming, naming, and tagging of devices in the Meraki Dashboard.
+Take a validated list of APs and automate bulk claiming, naming, tagging, and address assignment of devices in the Meraki Dashboard.
 
 **Input:**
 
@@ -120,6 +124,8 @@ Take a validated list of APs and automate bulk claiming, naming, and tagging of 
   - `AP Name`
   - `Connectivity`
   - `Connectivity Tag`
+  - `Diagnostic Tag`
+  - `Address`
 
 Typically, this file is derived from `*_validated_upload.csv` produced by the first script.
 
@@ -150,12 +156,13 @@ Typically, this file is derived from `*_validated_upload.csv` produced by the fi
        - On success, logs the claimed serials and increments totals.
        - If Meraki returns errors per serial, logs them and tracks failed serials.
        - If the batch claim fails entirely, logs the failure and marks all serials in the group as failed for this run.
-     - **Step B – update names and tags:**
+     - **Step B – update names, tags, and addresses:**
        - For each successfully claimed serial:
-         - Builds a tag list starting with `["diagnostic", "NEW-AP"]`.
+         - Builds a tag list starting with `["NEW-AP"]`, then appends `Diagnostic Tag` from the CSV (if present).
          - If `Connectivity` is `yes` and `Connectivity Tag` is present, appends that tag as well.
          - Uses `AP Name` as the target device name.
-         - Calls `dashboard.devices.updateDevice` to set both `name` and `tags`.
+         - Uses `Address` from the CSV when available; if present, also sets `moveMapMarker=True` so the device appears on the map.
+         - Calls `dashboard.devices.updateDevice` to set `name`, `tags`, and optionally `address`.
          - Logs success or failure for each device.
        - Displays a simple console progress bar while updating devices in a group.
 
@@ -186,7 +193,7 @@ Ensure that `validated_upload.csv` exists in the repository root and has been pr
 
 - **`claim_device.log`**  
   - Contains timestamped messages for each execution of `2_claim_devices.py`.
-  - Logs validation errors, claim attempts, and name/tag update results.
+  - Logs validation errors, claim attempts, and name/tag/address update results.
 
 ### Security Notes
 

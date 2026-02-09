@@ -16,7 +16,12 @@ if not API_KEY:
 
 dashboard = meraki.DashboardAPI(
     api_key=API_KEY,
-    suppress_logging=True
+    suppress_logging=True,
+    wait_on_rate_limit=True,      # Automatically sleep when a 429 occurs
+    maximum_retries=5,            # Try up to 5 times before failing
+    nginx_429_retry_wait_time=60, # Wait 60s if Nginx returns 429 without a timer
+    retry_4xx_error=False,
+    single_request_timeout=60   
 )
 
 def write_log(message):
@@ -54,13 +59,12 @@ def main():
     critical_error = False
     
     try:
-        # 1. Load data with semicolon separator
+        # 1. Load data
         df = pd.read_csv(INPUT_FILE, sep=';')
         df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
         df['line_number'] = df.index + 2
 
         # --- VALIDATION 1: Check for Duplicate Serials ---
-        # Updated to 'Serial Number'
         duplicate_mask = df.duplicated(subset=['Serial Number'], keep=False)
         if duplicate_mask.any():
             critical_error = True
@@ -69,7 +73,6 @@ def main():
                 write_log(f"[ERROR] Line {row['line_number']}: Duplicate serial '{row['Serial Number']}' found.")
 
         # --- VALIDATION 2: Check for Invalid Status or Already Added ---
-        # Updated to 'Status' and 'Already Added'
         invalid_mask = (df['Status'].astype(str).str.lower() != 'good') | \
                        (df['Already Added'].astype(str).str.lower() != 'false')
         
@@ -86,7 +89,6 @@ def main():
         total_to_process = len(df)
         print(f"Found {total_to_process} devices to process.")
 
-        # Group by the new header names
         grouped = df.groupby(['Network ID', 'Full Network Name', 'Org ID', 'Org Name'])
 
         total_claimed = 0
@@ -115,7 +117,7 @@ def main():
                         err_serial = err.get('serial', 'Unknown')
                         err_msg = ", ".join(err.get('errors', []))
                         ln = df[df['Serial Number'] == err_serial]['line_number'].values[0]
-                        write_log(f"\t[WARN] Line {ln}: Claim failed for {err_serial}: {err_msg}")
+                        write_log(f"\t[WARN] Line {ln}:  Claim failed for {err_serial}: {err_msg}")
                         failed_serials.append(f"Line {ln}: {err_serial}")
 
             except meraki.APIError as e:
@@ -124,30 +126,54 @@ def main():
                     failed_serials.append(f"Line {df[df['Serial Number']==s]['line_number'].values[0]}: {s}")
                 continue
 
-            # --- STEP B: UPDATE NAME & TAGS ---
+            # --- STEP B: UPDATE NAME, TAGS & ADDRESS ---
             if claimed_successfully:
-                print(f"Updating names and tags...")
+                print(f"Updating names, tags, and addresses...")
                 for i, serial in enumerate(claimed_successfully):
                     row = group[group['Serial Number'] == serial].iloc[0]
                     
-                    # Prepare Tags
-                    tags_to_apply = ["diagnostic", "NEW-AP"]
+                    # 1. Prepare Tags
+                    tags_to_apply = ["NEW-AP"] 
+                    
+                    diag_tag = row.get('Diagnostic Tag')
+                    if pd.notna(diag_tag) and str(diag_tag).lower() != 'nan' and str(diag_tag).strip() != '':
+                        tags_to_apply.append(str(diag_tag))
+
                     if str(row.get('Connectivity', '')).lower() == 'yes':
                         c_tag = row.get('Connectivity Tag')
-                        if c_tag and str(c_tag) != 'nan':
+                        if pd.notna(c_tag) and str(c_tag).lower() != 'nan' and str(c_tag).strip() != '':
                             tags_to_apply.append(str(c_tag))
 
-                    # Prepare Name from 'AP Name' column
+                    # 2. Prepare Name
                     target_name = str(row.get('AP Name', ''))
 
+                    # 3. Prepare Address (New Logic)
+                    raw_addr = row.get('Address')
+                    target_address = None
+                    if pd.notna(raw_addr) and str(raw_addr).lower() != 'nan' and str(raw_addr).strip() != '':
+                        target_address = str(raw_addr).strip()
+
                     try:
-                        # Update both Name and Tags
-                        dashboard.devices.updateDevice(
-                            serial, 
-                            name=target_name, 
-                            tags=tags_to_apply
-                        )
-                        write_log(f"\t[INFO] Line {row['line_number']}: {serial} updated to Name: {target_name}, Tags: {tags_to_apply}")
+                        # Construct Update Parameters
+                        update_params = {
+                            'serial': serial,
+                            'name': target_name,
+                            'tags': tags_to_apply
+                        }
+
+                        # Add Address parameters only if address exists
+                        if target_address:
+                            update_params['address'] = target_address
+                            update_params['moveMapMarker'] = True
+
+                        # Perform Update
+                        dashboard.devices.updateDevice(**update_params)
+                        
+                        log_msg = f"\t[INFO] Line {row['line_number']}: {serial} updated. Name: {target_name}, Tags: {tags_to_apply}"
+                        if target_address:
+                            log_msg += f", Address: {target_address}"
+                        write_log(log_msg)
+                        
                         total_updated += 1
                     except meraki.APIError as e:
                         write_log(f"\t[WARN] Line {row['line_number']}: {serial} update failed: {e.message}")
